@@ -977,6 +977,26 @@ async function importSheet(file){
 /* ---- Google 工作表 ---- */
 function sheetRef(url){return {id:(url.match(/\/spreadsheets\/d\/([\w-]+)/)||[])[1],gid:(url.match(/[#&?]gid=(\d+)/)||[])[1],pub:/\/spreadsheets\/d\/e\//.test(url)}}
 async function fetchCsv(u){const r=await fetch(u);if(!r.ok)throw new Error("http "+r.status);const x=await r.text();if(/^\s*<(!doctype|html)/i.test(x))throw new Error("html");return parseCSV(x.replace(/^﻿/,""))}
+/* Google 查詢介面的 JSONP 讀法：用 script 標籤載入，不受瀏覽器跨網站限制，適用「知道連結的任何人可檢視」的工作表 */
+function gvizToRows(r){
+  if(!r||r.status!=="ok"||!r.table)throw new Error("gviz");
+  const cols=r.table.cols||[],out=[];
+  if(cols.some(c=>c.label))out.push(cols.map(c=>c.label||""));
+  (r.table.rows||[]).forEach(row=>out.push(cols.map((c,i)=>{const x=row.c&&row.c[i];return x==null?"":(x.f!=null?x.f:(x.v==null?"":x.v))})));
+  return out;
+}
+function gvizJsonp(id,gid){
+  return new Promise((res,rej)=>{
+    const cb="__gv"+Date.now().toString(36);
+    const sc=document.createElement("script");
+    const done=()=>{clearTimeout(timer);delete window[cb];sc.remove()};
+    const timer=setTimeout(()=>{done();rej(new Error("timeout"))},10000);
+    window[cb]=r=>{done();try{res(gvizToRows(r))}catch(e){rej(e)}};
+    sc.onerror=()=>{done();rej(new Error("script"))};
+    sc.src=`https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:json;responseHandler:${cb}${gid?"&gid="+gid:""}`;
+    document.head.appendChild(sc);
+  });
+}
 async function fetchGoogleRows(url){
   const {id,gid,pub}=sheetRef(url);
   if(!id)throw new Error("連結格式不正確，請貼上完整的 Google 工作表網址");
@@ -989,8 +1009,11 @@ async function fetchGoogleRows(url){
       try{return await fetchCsv(u)}catch(e){}
     }
   }
+  if(!pub){try{const r=await gvizJsonp(id,gid);if(r.length)return r}catch(e){}}
   if(!driveOK||pub)throw new Error("無法讀取這份工作表。請把共用設定改成「知道連結的人都可檢視」，或在 Google 工作表按「檔案 → 分享 → 發布到網路」，選 CSV 格式後貼上該連結。");
-  const tok=await gToken("https://www.googleapis.com/auth/spreadsheets.readonly");
+  let tok;
+  try{tok=await gToken("https://www.googleapis.com/auth/spreadsheets.readonly")}
+  catch(e){throw new Error("無法直接讀取，改用 Google 登入也失敗。請把工作表的共用設為「知道連結的任何人」可檢視，或用「發布到網路」的 CSV 連結。")}
   const h={Authorization:"Bearer "+tok};
   const api="https://sheets.googleapis.com/v4/spreadsheets/"+id;
   const meta=await fetch(api+"?fields=sheets.properties(sheetId,title)",{headers:h});
