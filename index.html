@@ -273,9 +273,12 @@ const curOpts=sel=>CURS.map(c=>`<option value="${c}"${c===sel?" selected":""}>${
 const curPairs=CURS.map(c=>[c,`${c} ${CUR_NAME[c]}`]);
 
 /* Google 地圖連結（不需 API 金鑰） */
+/* 地點前面預設加上目的地；已含目的地，或明顯是台灣地點（例如出發前一晚的機場飯店）時不加 */
+const TW_RE=/台灣|臺灣|台北|臺北|桃園|松山|新北|台中|臺中|高雄|台南|臺南|新竹|基隆|Taiwan|Taipei|Taoyuan|TPE/i;
+const placeQ=(place,dest)=>(!dest||place.includes(dest)||TW_RE.test(place))?place:dest+" "+place;
 const mapSearch=q=>"https://www.google.com/maps/search/?api=1&query="+encodeURIComponent(q);
 function mapRoute(items,dest){
-  const ps=items.filter(i=>i.place).map(i=>(i.place.includes(dest)?i.place:dest+" "+i.place));
+  const ps=items.filter(i=>i.place).map(i=>placeQ(i.place,dest));
   if(ps.length<2)return null;
   const wp=ps.slice(1,-1).slice(0,9);
   let u="https://www.google.com/maps/dir/?api=1&origin="+encodeURIComponent(ps[0])+"&destination="+encodeURIComponent(ps[ps.length-1])+"&travelmode=transit";
@@ -504,7 +507,7 @@ function vPlan(t,days){
   ${items.length?`<div class="list">${items.map(i=>`<div class="card item">
     <div class="t">${esc(i.time||"--:--")}</div>
     <div class="body"><div class="ttl"><span class="chip t-${esc(i.type)}">${esc(i.type)}</span>${esc(i.title)}</div>
-      ${i.place?`<div class="meta"><a href="${mapSearch(i.place.includes(t.dest)?i.place:t.dest+" "+i.place)}" target="_blank" rel="noopener">地圖：${esc(i.place)}</a></div>`:""}
+      ${i.place?`<div class="meta"><a href="${mapSearch(placeQ(i.place,t.dest))}" target="_blank" rel="noopener">地圖：${esc(i.place)}</a></div>`:""}
       ${i.note?`<div class="meta">${esc(i.note)}</div>`:""}
       ${i.cost?`<div class="meta amt">${money(i.cost,i.cur)}</div>`:""}${byLine(t,i)}</div>
     <div class="acts"><button class="btn sm ghost" data-act="item-edit" data-id="${i.id}">編輯</button></div></div>`).join("")}</div>
