@@ -419,24 +419,25 @@ function joinForm(code){
 }
 
 /* ========== Google Drive 上傳（只存取本 App 建立的檔案）========== */
-let gTok=null,gExp=0,gClient=null,gRes=null,gRej=null;
+const gAuth={};
 function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement("script");s.src=src;s.async=true;s.onload=res;s.onerror=()=>rej(new Error("載入失敗"));document.head.appendChild(s)})}
-function gToken(){
+function gToken(scope="https://www.googleapis.com/auth/drive.file"){
   return new Promise((res,rej)=>{
-    if(gTok&&Date.now()<gExp-60000)return res(gTok);
+    const a=gAuth[scope]||(gAuth[scope]={});
+    if(a.tok&&Date.now()<a.exp-60000)return res(a.tok);
     if(!(window.google&&google.accounts&&google.accounts.oauth2))return rej(new Error("Google 登入元件尚未載入，請確認網路後再試"));
-    gRes=res;gRej=rej;
-    if(!gClient)gClient=google.accounts.oauth2.initTokenClient({
-      client_id:window.GOOGLE_CLIENT_ID,scope:"https://www.googleapis.com/auth/drive.file",
-      callback:r=>{if(r.error)return gRej(new Error(r.error_description||r.error));gTok=r.access_token;gExp=Date.now()+(r.expires_in||3600)*1000;S.gSeen=true;save();gRes(gTok)},
-      error_callback:e=>gRej(new Error(e&&e.type==="popup_closed"?"已取消 Google 登入":"Google 登入失敗，請允許彈出視窗後再試"))
+    a.res=res;a.rej=rej;
+    if(!a.client)a.client=google.accounts.oauth2.initTokenClient({
+      client_id:window.GOOGLE_CLIENT_ID,scope,
+      callback:r=>{if(r.error)return a.rej(new Error(r.error_description||r.error));a.tok=r.access_token;a.exp=Date.now()+(r.expires_in||3600)*1000;S.gSeen=true;save();a.res(a.tok)},
+      error_callback:e=>a.rej(new Error(e&&e.type==="popup_closed"?"已取消 Google 登入":"Google 登入失敗，請允許彈出視窗後再試"))
     });
-    gClient.requestAccessToken({prompt:S.gSeen?"":"consent"});
+    a.client.requestAccessToken({prompt:S.gSeen?"":"consent"});
   });
 }
 async function dFetch(tok,url,opt={}){
   const r=await fetch(url,{...opt,headers:{...(opt.headers||{}),Authorization:"Bearer "+tok}});
-  if(r.status===401){gTok=null;throw new Error("Google 登入已逾時，請再按一次儲存")}
+  if(r.status===401){Object.values(gAuth).forEach(a=>{a.tok=null});throw new Error("Google 登入已逾時，請再按一次儲存")}
   if(!r.ok&&r.status!==404)throw new Error("Google Drive 錯誤（"+r.status+"）");
   return r;
 }
@@ -607,9 +608,12 @@ function vMore(t){
   <div class="sec"><div class="sec-h"><h3>雲端同步</h3></div>${cloudCard(t)}</div>
 
   <div class="sec"><div class="sec-h"><h3>匯入行程</h3></div>
-    <div class="card" style="padding:14px;display:flex;flex-direction:column;gap:10px">
-      <div class="small muted">把做好的行程表（Excel 或 CSV）匯入「${esc(t.name.replace("（範例）",""))}」。欄位：日期、時間、類型、名稱、地點、備註、預估費用、幣別；只有日期和名稱必填。</div>
-      <div class="fa" style="flex-wrap:wrap"><button class="btn pri" data-act="sheet-import">選擇 Excel／CSV 檔案</button><button class="btn" data-act="sheet-template">下載 CSV 範本</button></div></div></div>
+    <div class="card" style="padding:14px;display:flex;flex-direction:column;gap:12px">
+      <div class="small muted">匯入到「${esc(t.name.replace("（範例）",""))}」。重複匯入不會產生重複項目。</div>
+      <label class="fld"><span>Google 工作表連結</span><input class="inline-in" id="sheetUrl" type="url" inputmode="url" placeholder="https://docs.google.com/spreadsheets/d/…" value="${esc(t.sheetUrl||"")}"></label>
+      <div class="fa"><button class="btn pri" data-act="gsheet-import">從 Google 工作表匯入</button></div>
+      <div class="small muted">工作表要設為「知道連結的人都可檢視」。欄位可用：日期（或日期與主題）、時間、類型、行程內容與景點說明、推薦交通方式、推薦店家/地點、備註、預算、幣別。日期欄空白時沿用上一列。</div>
+      <div class="fa" style="flex-wrap:wrap"><button class="btn" data-act="sheet-import">改選 Excel／CSV 檔案</button><button class="btn" data-act="sheet-template">下載 CSV 範本</button></div></div></div>
 
   <div class="sec"><div class="sec-h"><h3>同行者</h3><button class="btn sm" data-act="trav-edit">編輯</button></div>
     <div class="card" style="padding:12px 14px">${trav(t).map(esc).join("、")}</div></div>
@@ -703,6 +707,7 @@ const A={
   "me-edit"(){askMe()},
   "key-edit"(){openForm({title:"OpenWeather API 金鑰",fields:[{k:"k",l:"API key（可留空）",full:1}],vals:{k:S.owmKey},onSave(v){S.owmKey=v.k;save();render();toast("已儲存")}})},
   "sheet-import"(){$("#sheetFile").click()},
+  "gsheet-import"(){const u=($("#sheetUrl").value||"").trim();const t=trip();t.sheetUrl=u;save();importGoogle(u)},
   "sheet-template"(){downloadTemplate()},
   join(){joinForm("")},
   "sync-on"(){enableSync(trip())},
@@ -819,7 +824,16 @@ function docForm(d){
 }
 
 /* ========== 匯入 Excel／CSV 行程 ========== */
-const HDR={date:["日期","date","day","天數"],time:["時間","time"],type:["類型","type","分類"],title:["名稱","title","項目","行程","景點","活動"],place:["地點","place","地址","location"],note:["備註","note","notes","說明"],cost:["預估費用","費用","cost","金額","price"],cur:["幣別","currency","cur"]};
+const HDR={
+  date:["日期","日期與主題","日期/主題","日期主題","date","day","天數"],
+  time:["時間","time"],
+  type:["類型","type","分類"],
+  title:["名稱","title","項目","行程","景點","活動","行程內容與景點說明","行程內容","內容"],
+  trans:["推薦交通方式","交通方式","交通"],
+  place:["地點","place","地址","location","推薦店家/地點","推薦店家","店家/地點","店家"],
+  note:["備註","note","notes","說明"],
+  cost:["預估費用","費用","cost","金額","price","預算"],
+  cur:["幣別","currency","cur"]};
 function parseCSV(text){
   const first=text.split(/\r?\n/)[0]||"";
   const sep=(first.match(/\t/g)||[]).length>(first.match(/,/g)||[]).length?"\t":",";
@@ -879,50 +893,121 @@ function normType(v){
   if(/景|玩|逛|遊|參觀|spot|sight/i.test(v))return "景點";
   return "其他";
 }
+function mdToDate(m,d,t){const y0=pdate(t.start).getFullYear();let s=validDate(y0,m,d);if(s&&s<addDays(t.start,-60))s=validDate(y0+1,m,d);return s}
+/* 從「日期與主題」這類合併欄位取出日期，剩下的文字當作當天主題 */
+function extractDate(text,t){
+  let s=String(text??"").trim();if(!s)return {day:"",theme:""};
+  let day="",m;
+  if((m=s.match(/(\d{4})\s*[-\/.年]\s*(\d{1,2})\s*[-\/.月]\s*(\d{1,2})\s*日?/))){day=validDate(+m[1],+m[2],+m[3]);if(day)s=s.replace(m[0]," ")}
+  else if((m=s.match(/(\d{1,2})\s*[\/月]\s*(\d{1,2})\s*日?/))){day=mdToDate(+m[1],+m[2],t);if(day)s=s.replace(m[0]," ")}
+  const dn=s.match(/(?:\bD(?:ay)?\s*|第\s*)(\d{1,2})\s*(?:天|日)?/i);
+  if(dn){if(!day)day=addDays(t.start,+dn[1]-1);s=s.replace(dn[0]," ")}
+  if(!day&&/^\d{5}$/.test(s)){day=normDate(s,t);s=""}
+  const theme=s.replace(/[（(]\s*(?:週|周|星期)?[日一二三四五六]\s*[）)]/g," ").replace(/(?:週|周|星期)[日一二三四五六]/g," ").replace(/^[\s｜|\-–—:：,，、·・]+|[\s｜|\-–—:：,，、·・]+$/g,"").replace(/\s{2,}/g," ").trim();
+  return {day,theme:day?theme:""};
+}
+function parseCost(v){const m=String(v??"").replace(/[,，\s]/g,"").match(/\d+(?:\.\d+)?/);return m?parseFloat(m[0]):0}
+const CUR_RE=[[/日圓|日幣|円|JPY|¥/,"JPY"],[/新台幣|台幣|NT|TWD/,"TWD"],[/美金|美元|USD|US\$/,"USD"],[/歐元|EUR|€/,"EUR"],[/韓元|韓幣|KRW|₩/,"KRW"],[/泰銖|THB|฿/,"THB"],[/港幣|港元|HKD/,"HKD"],[/人民幣|CNY|RMB/,"CNY"],[/英鎊|GBP|£/,"GBP"],[/新加坡幣|新幣|SGD/,"SGD"],[/澳幣|澳元|AUD/,"AUD"],[/越南盾|VND/,"VND"],[/馬幣|令吉|MYR/,"MYR"]];
+function parseCur(v){const u=String(v??"").toUpperCase();if(!u.trim())return "";for(const [re,c] of CUR_RE)if(re.test(u))return c;return ""}
+const normH=s=>String(s??"").replace(/\s+/g,"").toLowerCase();
 function sheetToItems(rows,t){
   let hi=-1,idx={};
   for(let i=0;i<Math.min(rows.length,6);i++){
     const m={};
-    rows[i].forEach((h,j)=>{const k=String(h||"").trim().toLowerCase();for(const f in HDR)if(m[f]===undefined&&HDR[f].some(x=>x.toLowerCase()===k))m[f]=j});
+    rows[i].forEach((h,j)=>{const k=normH(h);if(!k)return;for(const f in HDR)if(m[f]===undefined&&HDR[f].some(x=>normH(x)===k))m[f]=j});
     if(m.date!==undefined&&m.title!==undefined){hi=i;idx=m;break}
   }
-  if(hi<0)return {error:"找不到標題列，第一列需要有「日期」和「名稱」欄位。可先下載範本對照。"};
+  if(hi<0)return {error:"找不到標題列，第一列需要有「日期」和「名稱」（或「日期與主題」和「行程內容與景點說明」）欄位。"};
   const have=new Set(t.items.map(i=>`${i.day}|${i.time||""}|${i.title}`));
-  const items=[];let dup=0;const bad=[];
+  const items=[],bad=[];let dup=0,curDay="",theme="",themeDone=true;
   rows.slice(hi+1).forEach((r,k)=>{
     const g=f=>idx[f]===undefined?"":String(r[idx[f]]??"").trim();
     if(r.every(c=>String(c??"").trim()===""))return;
-    const day=normDate(g("date"),t),title=g("title");
-    if(!day||!title){bad.push(hi+k+2);return}
+    const ex=extractDate(g("date"),t);
+    if(ex.day){curDay=ex.day;theme=ex.theme;themeDone=!theme} // 日期欄空白時沿用上一列日期（合併儲存格）
+    const raw=g("title")||g("place");
+    if(!raw){if(!ex.day&&Object.keys(idx).some(f=>f!=="date"&&g(f)))bad.push(hi+k+2);return} // 只有分隔標題文字的列直接略過
+    if(!curDay){bad.push(hi+k+2);return}
+    const lines=raw.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    let title=lines[0];const parts=[];
+    if(lines.length>1)parts.push(lines.slice(1).join(" "));
+    if(title.length>40){parts.unshift(title);title=title.slice(0,38)+"…"}
+    const tr=g("trans");if(tr)parts.push("交通："+tr.replace(/\s*\r?\n\s*/g," "));
+    const nt=g("note");if(nt)parts.push(nt.replace(/\s*\r?\n\s*/g," "));
+    const pl=g("place").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    if(pl.length>1)parts.push("地點："+pl.slice(1).join(" "));
+    if(!themeDone&&theme){parts.push("本日主題："+theme);themeDone=true}
     const time=normTime(g("time"));
-    const key=`${day}|${time}|${title}`;
+    const key=`${curDay}|${time}|${title}`;
     if(have.has(key)){dup++;return}
     have.add(key);
-    const cur=g("cur").toUpperCase();
-    items.push({id:uid(),day,time,type:normType(g("type")),title,place:g("place"),note:g("note"),cost:parseFloat(g("cost").replace(/[,，\s]/g,""))||0,cur:CURS.includes(cur)?cur:t.baseCur});
+    items.push({id:uid(),day:curDay,time,type:g("type")?normType(g("type")):normType(title+" "+(pl[0]||"")),title,place:pl[0]||"",note:parts.join(" ｜ "),cost:parseCost(g("cost")),cur:parseCur(g("cur"))||parseCur(g("cost"))||t.baseCur});
   });
   return {items,dup,bad};
 }
-async function importSheet(file){
+function importRows(rows){
   const t=trip();
-  let rows;
-  try{rows=await readSheet(file)}catch(e){return toast("無法讀取檔案，請確認格式是 .xlsx、.xls 或 .csv，且已連上網路（Excel 檔需要）")}
   const r=sheetToItems(rows,t);
   if(r.error)return toast(r.error);
-  if(!r.items.length)return toast(r.dup?`沒有新項目：${r.dup} 筆已存在`:"沒有可匯入的資料，請檢查日期與名稱欄位");
+  if(!r.items.length)return toast(r.dup?`沒有新項目：${r.dup} 筆已存在`:"沒有可匯入的資料，請檢查日期與行程內容欄位");
   const days=r.items.map(i=>i.day).sort();
-  const lo=days[0]<t.start?days[0]:t.start,hi=days[days.length-1]>t.end?days[days.length-1]:t.end;
+  const dMin=days[0],dMax=days[days.length-1];
+  let lo=t.start,hi=t.end,replace=false;
+  if(dMin<lo||dMax>hi){
+    if(!t.items.length){lo=dMin;hi=dMax;replace=true}
+    else{if(dMin<lo)lo=dMin;if(dMax>hi)hi=dMax}
+  }
+  if((pdate(hi)-pdate(lo))/864e5>59)return toast("匯入的日期和這趟旅程差太多（超過 60 天）。請先按「新增」建立新的旅程，再匯入。");
   const extend=lo!==t.start||hi!==t.end;
-  if(extend&&(pdate(hi)-pdate(lo))/864e5>59)return toast("日期範圍超過 60 天，請確認日期欄位是否有誤");
-  const msg=[`將新增 ${r.items.length} 筆項目到「${t.name.replace("（範例）","")}」，日期 ${fmtMD(days[0])} 至 ${fmtMD(days[days.length-1])}。`];
-  if(extend)msg.push(`有項目超出目前旅程日期，旅程會延長為 ${fmtMD(lo)} 至 ${fmtMD(hi)}。`);
+  const msg=[`將新增 ${r.items.length} 筆項目到「${t.name.replace("（範例）","")}」，日期 ${fmtMD(dMin)} 至 ${fmtMD(dMax)}。`];
+  if(extend)msg.push(replace?`這趟旅程還沒有行程，旅程日期會改為 ${fmtMD(lo)} 至 ${fmtMD(hi)}。`:`有項目超出目前旅程日期，旅程會延長為 ${fmtMD(lo)} 至 ${fmtMD(hi)}。`);
   if(r.dup)msg.push(`${r.dup} 筆與現有項目相同，已略過。`);
-  if(r.bad.length)msg.push(`第 ${r.bad.slice(0,6).join("、")} 列${r.bad.length>6?"等":""}缺少有效的日期或名稱，已略過。`);
+  if(r.bad.length)msg.push(`第 ${r.bad.slice(0,6).join("、")} 列${r.bad.length>6?"等":""}找不到日期或內容，已略過。`);
   openForm({title:"確認匯入",fields:msg.map((l,i)=>({k:"h"+i,t:"hint",l})),saveText:"匯入",onSave(){
     if(extend)updateTrip(t,{start:lo,end:hi});
     r.items.forEach(o=>upsert(t,"items",o,true));
-    ui.day=days[0];S.tab="plan";save();render();toast(`已匯入 ${r.items.length} 筆項目`);
+    ui.day=dMin;S.tab="plan";save();render();toast(`已匯入 ${r.items.length} 筆項目`);
   }});
+}
+async function importSheet(file){
+  let rows;
+  try{rows=await readSheet(file)}catch(e){return toast("無法讀取檔案，請確認格式是 .xlsx、.xls 或 .csv，且已連上網路（Excel 檔需要）")}
+  importRows(rows);
+}
+/* ---- Google 工作表 ---- */
+function sheetRef(url){return {id:(url.match(/\/spreadsheets\/d\/([\w-]+)/)||[])[1],gid:(url.match(/[#&?]gid=(\d+)/)||[])[1],pub:/\/spreadsheets\/d\/e\//.test(url)}}
+async function fetchCsv(u){const r=await fetch(u);if(!r.ok)throw new Error("http "+r.status);const x=await r.text();if(/^\s*<(!doctype|html)/i.test(x))throw new Error("html");return parseCSV(x.replace(/^﻿/,""))}
+async function fetchGoogleRows(url){
+  const {id,gid,pub}=sheetRef(url);
+  if(!id)throw new Error("連結格式不正確，請貼上完整的 Google 工作表網址");
+  const q=gid?"&gid="+gid:"";
+  if(pub){
+    const u=url.includes("output=csv")?url:url.replace(/\/pub(html)?(\?.*)?(#.*)?$/,"/pub")+"?output=csv"+q;
+    try{return await fetchCsv(u)}catch(e){}
+  }else{
+    for(const u of [`https://docs.google.com/spreadsheets/d/${id}/export?format=csv${q}`,`https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv${q}`]){
+      try{return await fetchCsv(u)}catch(e){}
+    }
+  }
+  if(!driveOK||pub)throw new Error("無法讀取這份工作表。請把共用設定改成「知道連結的人都可檢視」，或在 Google 工作表按「檔案 → 分享 → 發布到網路」，選 CSV 格式後貼上該連結。");
+  const tok=await gToken("https://www.googleapis.com/auth/spreadsheets.readonly");
+  const h={Authorization:"Bearer "+tok};
+  const api="https://sheets.googleapis.com/v4/spreadsheets/"+id;
+  const meta=await fetch(api+"?fields=sheets.properties(sheetId,title)",{headers:h});
+  if(!meta.ok)throw new Error(meta.status===403||meta.status===404?"這個 Google 帳號沒有這份工作表的檢視權限，或尚未啟用 Google Sheets API（見 README）":"讀取工作表失敗（"+meta.status+"）");
+  const sheets=(await meta.json()).sheets||[];
+  const sh=(gid&&sheets.find(x=>String(x.properties.sheetId)===gid))||sheets[0];
+  if(!sh)throw new Error("工作表裡沒有分頁");
+  const v=await fetch(api+"/values/"+encodeURIComponent("'"+sh.properties.title.replace(/'/g,"''")+"'")+"?valueRenderOption=FORMATTED_VALUE",{headers:h});
+  if(!v.ok)throw new Error("讀取工作表內容失敗（"+v.status+"）");
+  return (await v.json()).values||[];
+}
+async function importGoogle(url){
+  if(!/^https:\/\/docs\.google\.com\/spreadsheets\//.test(url))return toast("請貼上 Google 工作表的連結（docs.google.com/spreadsheets/…）");
+  toast("讀取中…");
+  let rows;
+  try{rows=await fetchGoogleRows(url)}catch(e){return toast(e&&e.message||"讀取失敗")}
+  importRows(rows);
 }
 function downloadTemplate(){
   const t=trip(),s=t.start;
@@ -1006,6 +1091,7 @@ document.addEventListener("change",e=>{
 document.addEventListener("input",e=>{
   if(e.target.id==="rAmt"){ui.rateAmt=parseFloat(e.target.value)||0;const o=$("#rOut");if(o)o.textContent=money(conv(ui.rateAmt,ui.rateFrom,ui.rateTo),ui.rateTo)}
   if(e.target.id==="aiReq")ui.aiReq=e.target.value;
+  if(e.target.id==="sheetUrl"){trip().sheetUrl=e.target.value.trim();save()}
 });
 window.addEventListener("online",softRender);
 window.addEventListener("offline",softRender);
