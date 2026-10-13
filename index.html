@@ -173,6 +173,7 @@ nav button[aria-current="page"]{color:var(--accent);font-weight:700}
 <nav id="nav" aria-label="主選單"></nav>
 <dialog id="dlg"></dialog>
 <input type="file" id="importFile" accept="application/json" hidden>
+<input type="file" id="sheetFile" accept=".xlsx,.xls,.csv,text/csv" hidden>
 
 <script>
 "use strict";
@@ -605,6 +606,11 @@ function vMore(t){
   </div><div>
   <div class="sec"><div class="sec-h"><h3>雲端同步</h3></div>${cloudCard(t)}</div>
 
+  <div class="sec"><div class="sec-h"><h3>匯入行程</h3></div>
+    <div class="card" style="padding:14px;display:flex;flex-direction:column;gap:10px">
+      <div class="small muted">把做好的行程表（Excel 或 CSV）匯入「${esc(t.name.replace("（範例）",""))}」。欄位：日期、時間、類型、名稱、地點、備註、預估費用、幣別；只有日期和名稱必填。</div>
+      <div class="fa" style="flex-wrap:wrap"><button class="btn pri" data-act="sheet-import">選擇 Excel／CSV 檔案</button><button class="btn" data-act="sheet-template">下載 CSV 範本</button></div></div></div>
+
   <div class="sec"><div class="sec-h"><h3>同行者</h3><button class="btn sm" data-act="trav-edit">編輯</button></div>
     <div class="card" style="padding:12px 14px">${trav(t).map(esc).join("、")}</div></div>
 
@@ -696,6 +702,8 @@ const A={
   "trav-edit"(){const t=trip();openForm({title:"同行者",fields:[{k:"names",l:"姓名（用逗號分隔）",full:1,req:1}],vals:{names:trav(t).join("，")},onSave(v){const a=v.names.split(/[,，、\s]+/).filter(Boolean);if(!a.length)return false;updateTrip(t,{travelers:a})}})},
   "me-edit"(){askMe()},
   "key-edit"(){openForm({title:"OpenWeather API 金鑰",fields:[{k:"k",l:"API key（可留空）",full:1}],vals:{k:S.owmKey},onSave(v){S.owmKey=v.k;save();render();toast("已儲存")}})},
+  "sheet-import"(){$("#sheetFile").click()},
+  "sheet-template"(){downloadTemplate()},
   join(){joinForm("")},
   "sync-on"(){enableSync(trip())},
   "sync-off"(){
@@ -810,6 +818,123 @@ function docForm(d){
     }});
 }
 
+/* ========== 匯入 Excel／CSV 行程 ========== */
+const HDR={date:["日期","date","day","天數"],time:["時間","time"],type:["類型","type","分類"],title:["名稱","title","項目","行程","景點","活動"],place:["地點","place","地址","location"],note:["備註","note","notes","說明"],cost:["預估費用","費用","cost","金額","price"],cur:["幣別","currency","cur"]};
+function parseCSV(text){
+  const first=text.split(/\r?\n/)[0]||"";
+  const sep=(first.match(/\t/g)||[]).length>(first.match(/,/g)||[]).length?"\t":",";
+  const rows=[];let row=[],f="",q=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(q){if(c==='"'){if(text[i+1]==='"'){f+='"';i++}else q=false}else f+=c}
+    else if(c==='"')q=true;
+    else if(c===sep){row.push(f);f=""}
+    else if(c==="\n"||c==="\r"){if(c==="\r"&&text[i+1]==="\n")i++;row.push(f);rows.push(row);row=[];f=""}
+    else f+=c;
+  }
+  if(f!==""||row.length){row.push(f);rows.push(row)}
+  return rows;
+}
+async function readSheet(file){
+  const buf=await file.arrayBuffer();
+  if(/\.(xlsx|xls)$/i.test(file.name)){
+    if(!window.XLSX)await loadScript("https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js");
+    const wb=XLSX.read(buf,{type:"array"});
+    return XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,raw:false,defval:"",dateNF:"yyyy-mm-dd"});
+  }
+  let text;
+  try{text=new TextDecoder("utf-8",{fatal:true}).decode(buf)}catch(e){text=new TextDecoder("big5").decode(buf)} // 中文版 Excel 另存的 CSV 常為 Big5
+  return parseCSV(text.replace(/^﻿/,""));
+}
+function validDate(y,m,d){const s=`${y}-${pad(m)}-${pad(d)}`;const x=pdate(s);return x.getFullYear()===y&&x.getMonth()+1===m&&x.getDate()===d?s:""}
+function normDate(v,t){
+  v=String(v??"").trim();if(!v)return "";
+  let m=v.match(/^(\d{4})[-\/.年](\d{1,2})[-\/.月](\d{1,2})/);
+  if(m)return validDate(+m[1],+m[2],+m[3]);
+  m=v.match(/^(\d{1,2})[\/\-.月](\d{1,2})日?$/);
+  if(m){
+    const y0=pdate(t.start).getFullYear();let s=validDate(y0,+m[1],+m[2]);
+    if(s&&s<addDays(t.start,-60))s=validDate(y0+1,+m[1],+m[2]);
+    return s;
+  }
+  m=v.match(/^(?:D|第)\s*(\d{1,2})\s*天?$/i);
+  if(m)return addDays(t.start,+m[1]-1);
+  if(/^\d{5}$/.test(v)){const d=new Date(Date.UTC(1899,11,30)+(+v)*864e5);return validDate(d.getUTCFullYear(),d.getUTCMonth()+1,d.getUTCDate())}
+  return "";
+}
+function normTime(v){
+  v=String(v??"").trim();if(!v)return "";
+  if(/^0?\.\d+$/.test(v)){const mins=Math.round(parseFloat(v)*1440);return `${pad(Math.floor(mins/60)%24)}:${pad(mins%60)}`}
+  const m=v.match(/(\d{1,2})[:：.](\d{2})/);if(!m)return "";
+  let h=+m[1];const mi=+m[2];
+  if(/pm|下午|晚上/i.test(v)&&h<12)h+=12;
+  if(/am|上午|凌晨/i.test(v)&&h===12)h=0;
+  return h<24&&mi<60?`${pad(h)}:${pad(mi)}`:"";
+}
+function normType(v){
+  v=String(v||"").trim();if(TYPES.includes(v))return v;
+  if(/餐|吃|食|咖啡|飲/.test(v))return "餐廳";
+  if(/住|宿|飯店|旅館|民宿|hotel/i.test(v))return "住宿";
+  if(/交通|車|機|航|船|地鐵|捷運|flight|train|bus/i.test(v))return "交通";
+  if(/景|玩|逛|遊|參觀|spot|sight/i.test(v))return "景點";
+  return "其他";
+}
+function sheetToItems(rows,t){
+  let hi=-1,idx={};
+  for(let i=0;i<Math.min(rows.length,6);i++){
+    const m={};
+    rows[i].forEach((h,j)=>{const k=String(h||"").trim().toLowerCase();for(const f in HDR)if(m[f]===undefined&&HDR[f].some(x=>x.toLowerCase()===k))m[f]=j});
+    if(m.date!==undefined&&m.title!==undefined){hi=i;idx=m;break}
+  }
+  if(hi<0)return {error:"找不到標題列，第一列需要有「日期」和「名稱」欄位。可先下載範本對照。"};
+  const have=new Set(t.items.map(i=>`${i.day}|${i.time||""}|${i.title}`));
+  const items=[];let dup=0;const bad=[];
+  rows.slice(hi+1).forEach((r,k)=>{
+    const g=f=>idx[f]===undefined?"":String(r[idx[f]]??"").trim();
+    if(r.every(c=>String(c??"").trim()===""))return;
+    const day=normDate(g("date"),t),title=g("title");
+    if(!day||!title){bad.push(hi+k+2);return}
+    const time=normTime(g("time"));
+    const key=`${day}|${time}|${title}`;
+    if(have.has(key)){dup++;return}
+    have.add(key);
+    const cur=g("cur").toUpperCase();
+    items.push({id:uid(),day,time,type:normType(g("type")),title,place:g("place"),note:g("note"),cost:parseFloat(g("cost").replace(/[,，\s]/g,""))||0,cur:CURS.includes(cur)?cur:t.baseCur});
+  });
+  return {items,dup,bad};
+}
+async function importSheet(file){
+  const t=trip();
+  let rows;
+  try{rows=await readSheet(file)}catch(e){return toast("無法讀取檔案，請確認格式是 .xlsx、.xls 或 .csv，且已連上網路（Excel 檔需要）")}
+  const r=sheetToItems(rows,t);
+  if(r.error)return toast(r.error);
+  if(!r.items.length)return toast(r.dup?`沒有新項目：${r.dup} 筆已存在`:"沒有可匯入的資料，請檢查日期與名稱欄位");
+  const days=r.items.map(i=>i.day).sort();
+  const lo=days[0]<t.start?days[0]:t.start,hi=days[days.length-1]>t.end?days[days.length-1]:t.end;
+  const extend=lo!==t.start||hi!==t.end;
+  if(extend&&(pdate(hi)-pdate(lo))/864e5>59)return toast("日期範圍超過 60 天，請確認日期欄位是否有誤");
+  const msg=[`將新增 ${r.items.length} 筆項目到「${t.name.replace("（範例）","")}」，日期 ${fmtMD(days[0])} 至 ${fmtMD(days[days.length-1])}。`];
+  if(extend)msg.push(`有項目超出目前旅程日期，旅程會延長為 ${fmtMD(lo)} 至 ${fmtMD(hi)}。`);
+  if(r.dup)msg.push(`${r.dup} 筆與現有項目相同，已略過。`);
+  if(r.bad.length)msg.push(`第 ${r.bad.slice(0,6).join("、")} 列${r.bad.length>6?"等":""}缺少有效的日期或名稱，已略過。`);
+  openForm({title:"確認匯入",fields:msg.map((l,i)=>({k:"h"+i,t:"hint",l})),saveText:"匯入",onSave(){
+    if(extend)updateTrip(t,{start:lo,end:hi});
+    r.items.forEach(o=>upsert(t,"items",o,true));
+    ui.day=days[0];S.tab="plan";save();render();toast(`已匯入 ${r.items.length} 筆項目`);
+  }});
+}
+function downloadTemplate(){
+  const t=trip(),s=t.start;
+  const rows=[["日期","時間","類型","名稱","地點","備註","預估費用","幣別"],
+    [s,"09:30","交通","抵達機場","羽田機場","",0,t.baseCur],
+    [s,"13:00","餐廳","午餐","築地場外市場","排隊約 30 分鐘",3000,"JPY"],
+    [addDays(s,1),"10:00","景點","明治神宮","明治神宮","",0,"JPY"]];
+  const csv="﻿"+rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\r\n");
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));a.download="行程匯入範本.csv";document.body.appendChild(a);a.click();a.remove();
+  toast("已下載範本，可用 Excel 開啟編輯");
+}
+
 /* ========== 外部服務 ========== */
 async function copyText(s){
   try{await navigator.clipboard.writeText(s);return true}catch(e){
@@ -864,6 +989,11 @@ document.addEventListener("change",e=>{
   if(el.matches('input[data-act="pk-toggle"]')){A["pk-toggle"](el.dataset.id);return}
   if(el.id==="rFrom"){ui.rateFrom=el.value;render()}
   if(el.id==="rTo"){ui.rateTo=el.value;render()}
+  if(el.id==="sheetFile"){
+    const f=el.files[0];if(!f)return;
+    importSheet(f).finally(()=>{el.value=""});
+    return;
+  }
   if(el.id==="importFile"){
     const f=el.files[0];if(!f)return;
     f.text().then(txt=>{
