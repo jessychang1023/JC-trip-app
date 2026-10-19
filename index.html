@@ -483,6 +483,58 @@ async function driveShare(tok,id,on){
   else await dFetch(tok,`https://www.googleapis.com/drive/v3/files/${id}/permissions/anyoneWithLink`,{method:"DELETE"});
 }
 
+/* ========== 匯出到行事曆（.ics，含提醒）==========
+   時間用「浮動時間」（不指定時區），手機在哪個地點就以當地時間響鈴，出國時最直覺。
+   每個事件有固定 UID，改了行程再匯入，行事曆會更新同一筆而不是重複。 */
+const icsEsc=v=>String(v||"").replace(/\\/g,"\\\\").replace(/\r?\n/g,"\\n").replace(/[,;]/g,"\\$&");
+function icsFold(line){
+  const enc=new TextEncoder(),out=[];let cur="",len=0;
+  for(const ch of line){const b=enc.encode(ch).length;if(len+b>73){out.push(cur);cur=" "+ch;len=1+b}else{cur+=ch;len+=b}}
+  out.push(cur);return out.join("\r\n");
+}
+function icsStamp(day,hm,addMin=0){
+  const [h,m]=hm.split(":").map(Number),[Y,M,D]=day.split("-").map(Number);
+  const d=new Date(Date.UTC(Y,M-1,D,h,m+addMin));
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}00`;
+}
+function buildICS(t,day,mins){
+  const list=t.items.filter(i=>(!day||i.day===day)&&/^\d{1,2}:\d{2}$/.test(i.time||"")).sort((a,b)=>(a.day+(a.time||"").padStart(5,"0")).localeCompare(b.day+(b.time||"").padStart(5,"0")));
+  if(!list.length)return {text:"",n:0};
+  const now=new Date(),stamp=`${now.getUTCFullYear()}${pad(now.getUTCMonth()+1)}${pad(now.getUTCDate())}T${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}00Z`;
+  const L=["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//旅程手帳//TW","CALSCALE:GREGORIAN","METHOD:PUBLISH","X-WR-CALNAME:"+icsEsc(t.name.replace("（範例）",""))];
+  list.forEach(i=>{
+    const hm=i.time.padStart(5,"0");
+    const place=i.place?String(i.place).split(/\r?\n/)[0].trim():"";
+    const desc=[i.note||"",place?"地圖："+mapSearch(placeQ(place,t.dest)):""].filter(Boolean).join("\n");
+    L.push("BEGIN:VEVENT","UID:"+i.id+"@tripbook","DTSTAMP:"+stamp,
+      "SEQUENCE:"+(Math.floor((i.at||0)/1000)%2000000000),
+      "DTSTART:"+icsStamp(i.day,hm),"DTEND:"+icsStamp(i.day,hm,60),
+      "SUMMARY:"+icsEsc(`${i.type?"["+i.type+"] ":""}${i.title}`));
+    if(place)L.push("LOCATION:"+icsEsc(place));
+    if(desc)L.push("DESCRIPTION:"+icsEsc(desc));
+    if(mins>0)L.push("BEGIN:VALARM","ACTION:DISPLAY","DESCRIPTION:"+icsEsc(`${mins} 分鐘後：${i.title}`),"TRIGGER:-PT"+mins+"M","END:VALARM");
+    L.push("END:VEVENT");
+  });
+  L.push("END:VCALENDAR");
+  return {text:L.map(icsFold).join("\r\n")+"\r\n",n:list.length};
+}
+
+/* --- Google 行事曆「加入活動」連結（一個行程一個連結；連結無法設定提醒，提醒用 Google 行事曆的預設通知）--- */
+const TZ_RULES=[[/日本|東京|大阪|京都|神戶|神户|關西|奈良|北海道|沖繩|福岡|名古屋|橫濱|Japan|Tokyo|Osaka|Kyoto|Kobe/i,"Asia/Tokyo"],[/韓國|首爾|釜山|濟州|Korea|Seoul/i,"Asia/Seoul"],[/泰國|曼谷|清邁|普吉|Thailand|Bangkok/i,"Asia/Bangkok"],[/香港|Hong Kong/i,"Asia/Hong_Kong"],[/新加坡|Singapore/i,"Asia/Singapore"],[/越南|河內|胡志明|峴港|Vietnam/i,"Asia/Ho_Chi_Minh"],[/馬來西亞|吉隆坡|Malaysia/i,"Asia/Kuala_Lumpur"],[/台灣|臺灣|台北|台中|高雄|台南|Taiwan/i,"Asia/Taipei"]];
+const tzOf=(t,i)=>{
+  if(i&&i.place&&TW_RE.test(i.place))return "Asia/Taipei"; // 例如出發前一晚的機場飯店
+  const r=TZ_RULES.find(([re])=>re.test(t.dest||""));return r?r[1]:"Asia/Taipei";
+};
+function gcalLink(t,i){
+  const hm=(i.time||"").padStart(5,"0");
+  const place=i.place?String(i.place).split(/\r?\n/)[0].trim():"";
+  const details=[i.note||"",place?"地圖："+mapSearch(placeQ(place,t.dest)):""].filter(Boolean).join("\n");
+  const q=new URLSearchParams({action:"TEMPLATE",text:`${i.type?"["+i.type+"] ":""}${i.title}`,dates:icsStamp(i.day,hm)+"/"+icsStamp(i.day,hm,60),ctz:tzOf(t,i)});
+  if(details)q.set("details",details);
+  if(place)q.set("location",place);
+  return "https://calendar.google.com/calendar/render?"+q.toString();
+}
+
 /* ========== 畫面 ========== */
 const ICON={
   plan:'<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>',
@@ -548,11 +600,13 @@ function vBudget(t){
     <button class="btn sm" data-act="trip-edit">調整預算</button></div>
     <div class="bar${over?" over":""}"><i style="width:${pct}%"></i></div>
     <div class="small ${over?"neg":"muted"}" style="margin-top:6px">${t.budget?(over?`超出預算 ${money(spent-t.budget,t.baseCur)}`:`剩餘 ${money(t.budget-spent,t.baseCur)}`):"尚未設定預算"}</div></div></div>
+  ${(()=>{const un=t.items.filter(i=>i.cost>0&&!linkedExp(t,i));if(!un.length)return "";const sum=un.reduce((a,i)=>a+conv(i.cost,i.cur||t.baseCur,t.baseCur),0);
+    return `<div class="sec"><div class="card" style="padding:12px 14px"><div class="kv" style="align-items:center"><span>行程裡有 ${un.length} 項預估費用還沒記入預算<br><span class="small muted amt">合計約 ${money(sum,t.baseCur)}</span></span><button class="btn sm" data-act="exp-from-items">加入花費</button></div></div></div>`})()}
   ${byCat.length?`<div class="sec"><div class="sec-h"><h3>分類統計</h3></div><div class="card">${byCat.map(([c,v])=>`<div class="kv"><span>${c}</span><span class="amt">${money(v,t.baseCur)}</span></div>`).join("")}</div></div>`:""}
   ${spent>0&&tr.length>1?`<div class="sec"><div class="sec-h"><h3>分帳（平均分攤）</h3></div><div class="card">${tr.map((n,i)=>{const d=paid[i]-share;return `<div class="kv"><span>${esc(n)} <span class="small muted">已付 ${money(paid[i],t.baseCur)}</span></span><span class="amt ${d>=0?"pos":"neg"}">${d>=0?"應收 ":"應付 "}${money(Math.abs(d),t.baseCur)}</span></div>`}).join("")}</div></div>`:""}</div>
   <div><div class="sec"><div class="sec-h"><h3>花費記錄</h3><button class="btn sm pri" data-act="exp-add">記一筆</button></div>
   ${t.expenses.length?`<div class="card">${[...t.expenses].sort((a,b)=>b.date.localeCompare(a.date)).map(e=>`<div class="kv" style="align-items:center">
-    <div style="min-width:0"><div style="overflow-wrap:anywhere">${esc(e.title)}</div><div class="small muted">${fmtMD(e.date)} · ${esc(e.cat)} · ${esc(e.payer||"—")} 付款</div>${byLine(t,e)}</div>
+    <div style="min-width:0"><div style="overflow-wrap:anywhere">${esc(e.title)}</div><div class="small muted">${fmtMD(e.date)} · ${esc(e.cat)} · ${esc(e.payer||"—")} 付款${e.itemId?" · 來自行程":""}</div>${byLine(t,e)}</div>
     <div style="text-align:right"><div class="amt">${money(e.amt,e.cur)}</div>${e.cur!==t.baseCur?`<div class="small muted amt">≈ ${money(conv(e.amt,e.cur,t.baseCur),t.baseCur)}</div>`:""}<button class="btn sm ghost" data-act="exp-edit" data-id="${e.id}">編輯</button></div></div>`).join("")}</div>`
    :`<div class="empty">還沒有花費記錄。每次付款後記一筆，匯率會自動換算成 ${t.baseCur}。</div>`}</div></div></div>`;
 }
@@ -663,6 +717,12 @@ function vMore(t){
       <div class="small muted">工作表要設為「知道連結的人都可檢視」。欄位可用：日期（或日期與主題）、時間、類型、行程內容與景點說明、推薦交通方式、推薦店家/地點、備註、預算、幣別。日期欄空白時沿用上一列。</div>
       <div class="fa" style="flex-wrap:wrap"><button class="btn" data-act="sheet-import">改選 Excel／CSV 檔案</button><button class="btn" data-act="sheet-template">下載 CSV 範本</button></div></div></div>
 
+  <div class="sec"><div class="sec-h"><h3>行事曆提醒</h3></div>
+    <div class="card" style="padding:14px;display:flex;flex-direction:column;gap:10px">
+      <div class="small muted">把有填時間的行程匯出到手機行事曆，並在開始前提醒。提醒由手機系統發出，不需要開著這個 App，也不用網路。</div>
+      <div class="fa" style="flex-wrap:wrap"><button class="btn pri" data-act="cal-export">匯出 .ics（iPhone／Google）</button><button class="btn" data-act="cal-google">Google 行事曆連結</button></div>
+      <div class="small muted">Google 行事曆：.ics 可一次匯入整趟；連結則是一個行程加一次，但不能設定提醒，要靠 Google 行事曆的預設通知。</div></div></div>
+
   <div class="sec"><div class="sec-h"><h3>同行者</h3><button class="btn sm" data-act="trav-edit">編輯</button></div>
     <div class="card" style="padding:12px 14px">${trav(t).map(esc).join("、")}</div></div>
 
@@ -741,6 +801,12 @@ const A={
   "item-add"(){itemForm(null)},
   "item-edit"(id){itemForm(trip().items.find(i=>i.id===id))},
   "exp-add"(){expForm(null)},
+  "exp-from-items"(){
+    const t=trip(),un=t.items.filter(i=>i.cost>0&&!linkedExp(t,i));
+    openForm({title:`把 ${un.length} 項預估費用加入花費？`,saveText:"加入",
+      fields:[{k:"h",t:"hint",l:"會為每個有預估費用、還沒記入的行程項目新增一筆花費，日期用該行程的日期，付款人是你。之後在行程裡改費用，會同步更新這些花費。若你比較想把預估當作預算規劃、實際付款再記，請不要加入。"}],
+      onSave(){un.forEach(i=>upsert(t,"expenses",{id:uid(),itemId:i.id,date:i.day,title:i.title,amt:i.cost,cur:i.cur||t.baseCur,cat:TYPE2CAT[i.type]||"其他",payer:defPayer(t)},true));render();toast(`已加入 ${un.length} 筆花費`)}});
+  },
   "exp-edit"(id){expForm(trip().expenses.find(e=>e.id===id))},
   "pk-toggle"(id){const t=trip();const p=t.packing.find(x=>x.id===id);if(p)upsert(t,"packing",{...p,done:!p.done})},
   "pk-del"(id){remove(trip(),"packing",id)},
@@ -782,6 +848,33 @@ const A={
     const t=trip();
     openForm({title:"停止同步這趟旅程？",fields:[{k:"h",t:"hint",l:"此裝置會保留目前內容，但不再與雲端或同行者同步。雲端資料不會被刪除。"}],saveText:"停止同步",onSave(){unsubscribe(t);delete t.code;save();render();toast("已停止同步")}});
   },
+  "cal-google"(){
+    const t=trip();
+    const list=t.items.filter(i=>/^\d{1,2}:\d{2}$/.test(i.time||"")).sort((a,b)=>(a.day+(a.time||"").padStart(5,"0")).localeCompare(b.day+(b.time||"").padStart(5,"0")));
+    if(!list.length){toast("沒有填時間的行程可以加入");return}
+    const days=[...new Set(list.map(i=>i.day))];
+    const d=$("#dlg");
+    d.innerHTML=`<form method="dialog" id="f"><h3>加到 Google 行事曆</h3><div class="fg">
+      <div class="fld full small muted">每個行程一個連結，點了會開 Google 行事曆的新增畫面，按「儲存」即可。時區依目的地和地點自動判斷（${esc(tzOf(t,null))}，出發前的台灣地點用台北時間）。連結不能設提醒，請到 Google 行事曆「設定」把預設通知設成 30 分鐘。要一次加入整趟並帶提醒，請用「匯出 .ics」。</div>
+      ${days.map(day=>`<div class="fld full"><span>${fmtMD(day)} ${fmtWD(day)}</span><div style="margin-top:6px">${list.filter(i=>i.day===day).map(i=>`<div class="kv" style="align-items:center"><span class="small" style="min-width:0;overflow-wrap:anywhere">${esc(i.time)} ${esc(i.title)}</span><a class="btn sm" href="${gcalLink(t,i)}" target="_blank" rel="noopener">加入</a></div>`).join("")}</div></div>`).join("")}</div>
+      <div class="fa"><span style="flex:1"></span><button class="btn" value="x">關閉</button></div></form>`;
+    if(!d.open)d.showModal();
+  },
+  "cal-export"(){
+    const t=trip(),days=daysOf(t);
+    openForm({title:"匯出到行事曆",saveText:"下載 .ics",
+      fields:[{k:"scope",l:"範圍",t:"select",full:1,opts:[["all","整趟旅程"],["day",`只有目前這一天（${fmtMD(ui.day||t.start)}）`]]},
+        {k:"mins",l:"提前提醒",t:"select",full:1,opts:[["30","30 分鐘前"],["10","10 分鐘前"],["60","1 小時前"],["0","不提醒"]]},
+        {k:"h",t:"hint",l:"只會匯出有填「時間」的項目，預設每項 1 小時。下載後點開檔案，選「加入行事曆」。之後改了行程再匯入一次，會更新同一筆，不會重複。時間以手機當地時間為準，人在日本時就是日本時間。"}],
+      vals:{scope:"all",mins:"30"},
+      onSave(v){
+        const r=buildICS(t,v.scope==="day"?(ui.day||t.start):null,parseInt(v.mins,10)||0);
+        if(!r.n){toast("沒有填時間的行程可以匯出");return false}
+        const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([r.text],{type:"text/calendar;charset=utf-8"}));
+        a.download=`${t.name.replace("（範例）","").replace(/[\\/:*?"<>|]/g,"_")||"旅程"}.ics`;document.body.appendChild(a);a.click();a.remove();
+        toast(`已下載 ${r.n} 個行程`);
+      }});
+  },
   export(){
     const blob=new Blob([JSON.stringify(S,null,1)],{type:"application/json"});
     const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`旅程手帳-${dstr(new Date())}.json`;document.body.appendChild(a);a.click();a.remove();
@@ -811,21 +904,33 @@ function tripForm(t){
       }else updateTrip(t,{name:v.name.replace("（範例）","")+(t.example?"（範例）":""),dest:v.dest,start:v.start,end:v.end,baseCur:v.baseCur,budget:v.budget});
     }});
 }
+/* 行程項目與花費的連結：花費記錄帶有 itemId，指回來源行程。
+   編輯行程時，費用、名稱、日期若有改動，會同步更新連結的花費；取消勾選會移除那筆花費；刪除行程也一併移除。 */
+/* 舊版「同時記入花費」建立的花費沒有 itemId，用日期、名稱、金額、幣別比對，視為同一筆 */
+const linkedExp=(t,i)=>t.expenses.find(e=>e.itemId===i.id)||t.expenses.find(e=>!e.itemId&&i.cost>0&&e.date===i.day&&e.title===i.title&&e.amt===i.cost&&e.cur===(i.cur||t.baseCur));
 function itemForm(it){
-  const t=trip(),days=daysOf(t);
+  const t=trip(),days=daysOf(t),lk=it?linkedExp(t,it):null;
   openForm({title:it?"編輯項目":"新增項目",
     fields:[{k:"title",l:"名稱",req:1,full:1,ph:"例如：淺草寺"},
       {k:"day",l:"日期",t:"select",opts:days.map((d,i)=>[d,`D${i+1} ${fmtMD(d)}`])},{k:"time",l:"時間",t:"time"},
       {k:"type",l:"類型",t:"select",opts:TYPES},{k:"cost",l:"預估費用",t:"number"},
       {k:"cur",l:"幣別",t:"select",opts:curPairs},
       {k:"place",l:"地點（用於 Google 地圖）",full:1,ph:"地名或地址"},{k:"note",l:"備註",t:"textarea",full:1},
-      ...(it?[]:[{k:"addExp",l:"同時記入花費",t:"checkbox",full:1}])],
-    vals:it||{day:ui.day,type:"景點",cur:t.baseCur,time:""},
-    onDelete:it?()=>remove(t,"items",it.id):null,
+      {k:"addExp",l:"記入預算（花費記錄）",t:"checkbox",full:1},
+      {k:"h",t:"hint",l:lk?"已記入預算。改費用、名稱或日期會同步更新那筆花費；取消勾選會移除它。":"勾選後，會在「預算」分頁新增一筆花費（類別依項目類型），之後改這裡的費用會跟著更新。"}],
+    vals:it?{...it,addExp:!!lk}:{day:ui.day,type:"景點",cur:t.baseCur,time:"",addExp:false},
+    onDelete:it?()=>{const e=linkedExp(t,it);if(e)remove(t,"expenses",e.id);remove(t,"items",it.id)}:null,
     onSave(v){
+      if(v.addExp&&!(v.cost>0)){toast("要記入預算，請先填預估費用");return false}
+      const id=it?it.id:uid();
       const o={title:v.title,day:v.day,time:v.time,type:v.type,cost:v.cost,cur:v.cur,place:v.place,note:v.note};
-      upsert(t,"items",{...(it||{id:uid()}),...o},true);
-      if(!it&&v.addExp&&v.cost)upsert(t,"expenses",{id:uid(),date:v.day,title:v.title,amt:v.cost,cur:v.cur,cat:TYPE2CAT[v.type]||"其他",payer:defPayer(t)},true);
+      upsert(t,"items",{...(it||{id}),...o},true);
+      const e=it?linkedExp(t,it):null;
+      const ex={date:v.day,title:v.title,amt:v.cost,cur:v.cur,cat:TYPE2CAT[v.type]||"其他"};
+      if(v.addExp){
+        if(!e)upsert(t,"expenses",{id:uid(),itemId:id,...ex,payer:defPayer(t)},true);
+        else if(!e.itemId||!it||it.cost!==v.cost||it.cur!==v.cur||it.title!==v.title||it.day!==v.day||it.type!==v.type)upsert(t,"expenses",{...e,itemId:id,...ex},true);
+      }else if(e)remove(t,"expenses",e.id);
       ui.day=v.day;render();
     }});
 }
