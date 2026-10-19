@@ -194,7 +194,7 @@ const PRESET_PACK=["護照／簽證","機票與訂房憑證","信用卡與少量
 /* 預設概略匯率（以 USD 為基準），按「更新匯率」後改用即時資料 */
 const DEFAULT_RATES={USD:1,TWD:31,JPY:150,EUR:.92,KRW:1380,THB:35,HKD:7.8,CNY:7.2,GBP:.78,SGD:1.34,AUD:1.5,VND:25000,MYR:4.4};
 const WD=["日","一","二","三","四","五","六"];
-const COLLS=["items","expenses","packing","docs","shopping"];
+const COLLS=["items","expenses","packing","docs","shopping","settlements"];
 
 const pad=n=>String(n).padStart(2,"0");
 const dstr=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
@@ -218,7 +218,7 @@ const driveOK=!!(window.GOOGLE_CLIENT_ID&&!/YOUR/.test(window.GOOGLE_CLIENT_ID))
 /* ========== 資料 ========== */
 function newTrip(o){
   const today=dstr(new Date());
-  return {id:uid(),name:"",dest:"",start:today,end:today,baseCur:"TWD",budget:0,travelers:[],items:[],expenses:[],packing:[],docs:[],shopping:[],...o};
+  return {id:uid(),name:"",dest:"",start:today,end:today,baseCur:"TWD",budget:0,travelers:[],items:[],expenses:[],packing:[],docs:[],shopping:[],settlements:[],...o};
 }
 function seed(){
   const start=addDays(dstr(new Date()),30);
@@ -587,6 +587,47 @@ function vPlan(t,days){
    :`<div class="empty">這天還沒有安排。按「新增項目」加入第一個景點、餐廳、住宿或交通。</div>`}</div>`;
 }
 
+/* --- 分帳 ---
+   每筆花費有「付款人」和「分帳對象」（split，沒設定的舊資料視為全體同行者均分）。
+   結餘 = 已支付 − 應分攤 ＋ 已還出 − 已收到。正數是別人欠他，負數是他欠別人。 */
+const splitOf=(t,e)=>e.split&&e.split.length?e.split:trav(t);
+function settle(t){
+  const names=[...trav(t)];
+  const add=n=>{if(n&&!names.includes(n))names.push(n)};
+  t.expenses.forEach(e=>{add(e.payer);(e.split||[]).forEach(add)});
+  t.settlements.forEach(x=>{add(x.from);add(x.to)});
+  const row={};names.forEach(n=>{row[n]={name:n,paid:0,share:0,sent:0,got:0}});
+  t.expenses.forEach(e=>{
+    const a=conv(e.amt,e.cur,t.baseCur),sp=splitOf(t,e).filter(n=>row[n]);
+    if(row[e.payer])row[e.payer].paid+=a;
+    if(sp.length)sp.forEach(n=>{row[n].share+=a/sp.length});
+  });
+  t.settlements.forEach(x=>{const a=conv(x.amt,x.cur||t.baseCur,t.baseCur);if(row[x.from])row[x.from].sent+=a;if(row[x.to])row[x.to].got+=a});
+  const eps=["JPY","KRW","VND"].includes(t.baseCur)?.5:.005;
+  const rows=names.map(n=>{const r=row[n];r.net=r.paid-r.share+r.sent-r.got;if(Math.abs(r.net)<eps)r.net=0;return r});
+  const cr=rows.filter(r=>r.net>0).map(r=>({n:r.name,v:r.net})).sort((a,b)=>b.v-a.v);
+  const db=rows.filter(r=>r.net<0).map(r=>({n:r.name,v:-r.net})).sort((a,b)=>b.v-a.v);
+  const transfers=[];let i=0,j=0;
+  while(i<db.length&&j<cr.length){
+    const m=Math.min(db[i].v,cr[j].v);
+    if(m>=eps)transfers.push({from:db[i].n,to:cr[j].n,amt:m});
+    db[i].v-=m;cr[j].v-=m;
+    if(db[i].v<eps)i++;if(cr[j].v<eps)j++;
+  }
+  return {rows,transfers};
+}
+function splitCard(t){
+  if(!t.expenses.length)return "";
+  const {rows,transfers}=settle(t);
+  if(rows.length<2)return "";
+  const B=t.baseCur;
+  return `<div class="sec"><div class="sec-h"><h3>分帳結算</h3><button class="btn sm" data-act="settle-add">記錄還款</button></div>
+  <div class="card">${rows.map(r=>`<div class="kv" style="align-items:center"><span style="min-width:0"><b>${esc(r.name)}</b><br><span class="small muted amt">已支付 ${money(r.paid,B)} · 應分攤 ${money(r.share,B)}${r.sent||r.got?` · 還款 ${r.sent?"付出 "+money(r.sent,B):""}${r.sent&&r.got?"、":""}${r.got?"收到 "+money(r.got,B):""}`:""}</span></span>
+    <span class="amt ${r.net>0?"pos":r.net<0?"neg":"muted"}">${r.net>0?"可收回 "+money(r.net,B):r.net<0?"還欠 "+money(-r.net,B):"已結清"}</span></div>`).join("")}</div>
+  ${transfers.length?`<div class="card" style="margin-top:10px"><div class="small muted" style="margin-bottom:4px">建議結清方式（還款次數最少）</div>${transfers.map((x,k)=>`<div class="kv" style="align-items:center"><span>${esc(x.from)} → ${esc(x.to)} <b class="amt">${money(x.amt,B)}</b></span><button class="btn sm" data-act="settle-add" data-id="${k}">記錄已還</button></div>`).join("")}</div>`:`<div class="small muted" style="margin-top:8px">目前沒有待結清的款項。</div>`}
+  ${t.settlements.length?`<div class="card" style="margin-top:10px"><div class="small muted" style="margin-bottom:4px">還款記錄</div>${[...t.settlements].sort((a,b)=>b.date.localeCompare(a.date)).map(x=>`<div class="kv" style="align-items:center"><span class="small">${fmtMD(x.date)} ${esc(x.from)} → ${esc(x.to)} <b class="amt">${money(x.amt,x.cur||B)}</b>${byLine(t,x)}</span><button class="btn sm ghost" data-act="settle-del" data-id="${x.id}">刪除</button></div>`).join("")}</div>`:""}</div>`;
+}
+
 /* --- 預算 --- */
 function sumExp(t){return t.expenses.reduce((s,e)=>s+conv(e.amt,e.cur,t.baseCur),0)}
 function vBudget(t){
@@ -603,10 +644,10 @@ function vBudget(t){
   ${(()=>{const un=t.items.filter(i=>i.cost>0&&!linkedExp(t,i));if(!un.length)return "";const sum=un.reduce((a,i)=>a+conv(i.cost,i.cur||t.baseCur,t.baseCur),0);
     return `<div class="sec"><div class="card" style="padding:12px 14px"><div class="kv" style="align-items:center"><span>行程裡有 ${un.length} 項預估費用還沒記入預算<br><span class="small muted amt">合計約 ${money(sum,t.baseCur)}</span></span><button class="btn sm" data-act="exp-from-items">加入花費</button></div></div></div>`})()}
   ${byCat.length?`<div class="sec"><div class="sec-h"><h3>分類統計</h3></div><div class="card">${byCat.map(([c,v])=>`<div class="kv"><span>${c}</span><span class="amt">${money(v,t.baseCur)}</span></div>`).join("")}</div></div>`:""}
-  ${spent>0&&tr.length>1?`<div class="sec"><div class="sec-h"><h3>分帳（平均分攤）</h3></div><div class="card">${tr.map((n,i)=>{const d=paid[i]-share;return `<div class="kv"><span>${esc(n)} <span class="small muted">已付 ${money(paid[i],t.baseCur)}</span></span><span class="amt ${d>=0?"pos":"neg"}">${d>=0?"應收 ":"應付 "}${money(Math.abs(d),t.baseCur)}</span></div>`}).join("")}</div></div>`:""}</div>
+  ${splitCard(t)}</div>
   <div><div class="sec"><div class="sec-h"><h3>花費記錄</h3><button class="btn sm pri" data-act="exp-add">記一筆</button></div>
   ${t.expenses.length?`<div class="card">${[...t.expenses].sort((a,b)=>b.date.localeCompare(a.date)).map(e=>`<div class="kv" style="align-items:center">
-    <div style="min-width:0"><div style="overflow-wrap:anywhere">${esc(e.title)}</div><div class="small muted">${fmtMD(e.date)} · ${esc(e.cat)} · ${esc(e.payer||"—")} 付款${e.itemId?" · 來自行程":""}</div>${byLine(t,e)}</div>
+    <div style="min-width:0"><div style="overflow-wrap:anywhere">${esc(e.title)}</div><div class="small muted">${fmtMD(e.date)} · ${esc(e.cat)} · ${esc(e.payer||"—")} 付款${e.split&&e.split.length&&e.split.length<trav(t).length?" · 分帳："+e.split.map(esc).join("、"):""}${e.itemId?" · 來自行程":""}</div>${byLine(t,e)}</div>
     <div style="text-align:right"><div class="amt">${money(e.amt,e.cur)}</div>${e.cur!==t.baseCur?`<div class="small muted amt">≈ ${money(conv(e.amt,e.cur,t.baseCur),t.baseCur)}</div>`:""}<button class="btn sm ghost" data-act="exp-edit" data-id="${e.id}">編輯</button></div></div>`).join("")}</div>`
    :`<div class="empty">還沒有花費記錄。每次付款後記一筆，匯率會自動換算成 ${t.baseCur}。</div>`}</div></div></div>`;
 }
@@ -739,6 +780,7 @@ function vMore(t){
 /* ========== 表單對話框 ========== */
 function fieldHtml(f,v){
   if(f.t==="hint")return `<div class="fld full small muted">${esc(f.l)}</div>`;
+  if(f.t==="multi")return `<div class="fld full"><span>${esc(f.l)}</span><div style="display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:6px">${f.opts.map(o=>`<label style="display:inline-flex;align-items:center;gap:6px;font-size:14px;color:var(--ink);letter-spacing:0"><input type="checkbox" data-multi="${esc(f.k)}" value="${esc(o)}"${(v||[]).includes(o)?" checked":""}>${esc(o)}</label>`).join("")}</div></div>`;
   const cls="fld"+(f.full?" full":"")+(f.t==="checkbox"?" cb":"");
   const id="f_"+f.k,req=f.req?" required":"";
   let inner;
@@ -760,6 +802,7 @@ function openForm({title,fields,vals={},onSave,onDelete,saveText="儲存"}){
     e.preventDefault();const out={};
     for(const f of fields){
       if(f.t==="hint")continue;
+      if(f.t==="multi"){out[f.k]=[...form.querySelectorAll(`input[data-multi="${f.k}"]:checked`)].map(x=>x.value);continue}
       const el=form.elements[f.k];
       if(f.t==="checkbox")out[f.k]=el.checked;
       else if(f.t==="number")out[f.k]=parseFloat(el.value)||0;
@@ -801,6 +844,8 @@ const A={
   "item-add"(){itemForm(null)},
   "item-edit"(id){itemForm(trip().items.find(i=>i.id===id))},
   "exp-add"(){expForm(null)},
+  "settle-add"(id){const x=id!==undefined?settle(trip()).transfers[+id]:null;settleForm(x?{from:x.from,to:x.to,amt:Math.round(x.amt*100)/100,date:dstr(new Date())}:null)},
+  "settle-del"(id){remove(trip(),"settlements",id)},
   "exp-from-items"(){
     const t=trip(),un=t.items.filter(i=>i.cost>0&&!linkedExp(t,i));
     openForm({title:`把 ${un.length} 項預估費用加入花費？`,saveText:"加入",
@@ -936,17 +981,34 @@ function itemForm(it){
 }
 function expForm(e){
   const t=trip();
-  const payers=[...trav(t)];if(e&&e.payer&&!payers.includes(e.payer))payers.push(e.payer);
+  const people=[...trav(t)];
+  [e&&e.payer,...((e&&e.split)||[])].forEach(n=>{if(n&&!people.includes(n))people.push(n)});
   openForm({title:e?"編輯花費":"記一筆花費",
     fields:[{k:"title",l:"項目",req:1,full:1,ph:"例如：晚餐拉麵"},{k:"amt",l:"金額",t:"number",req:1},
       {k:"cur",l:"幣別",t:"select",opts:curPairs},
       {k:"date",l:"日期",t:"date"},{k:"cat",l:"分類",t:"select",opts:CATS},
-      {k:"payer",l:"付款人",t:"select",opts:payers,full:1}],
-    vals:e||{date:ui.day||t.start,cur:t.baseCur,cat:"餐飲",payer:defPayer(t)},
+      {k:"payer",l:"誰先付的",t:"select",opts:people,full:1},
+      {k:"split",l:"這筆要分給誰（打勾的人均分）",t:"multi",opts:people},
+      {k:"h",t:"hint",l:"只有自己的花費就只勾自己；付款人沒勾也可以，代表他幫別人付。"}],
+    vals:e?{...e,split:splitOf(t,e)}:{date:ui.day||t.start,cur:t.baseCur,cat:"餐飲",payer:defPayer(t),split:trav(t)},
     onDelete:e?()=>remove(t,"expenses",e.id):null,
     onSave(v){
       if(!v.amt){toast("請輸入金額");return false}
+      if(!v.split.length){toast("至少要勾選一位分帳對象");return false}
       upsert(t,"expenses",{...(e||{id:uid()}),...v});
+    }});
+}
+function settleForm(pre){
+  const t=trip(),{rows}=settle(t),names=rows.map(r=>r.name);
+  openForm({title:"記錄還款",saveText:"記錄",
+    fields:[{k:"from",l:"誰還錢",t:"select",opts:names},{k:"to",l:"還給誰",t:"select",opts:names},
+      {k:"amt",l:`金額（${t.baseCur}）`,t:"number",req:1},{k:"date",l:"日期",t:"date"},
+      {k:"h",t:"hint",l:"還款只是記錄兩人之間的轉帳，不會算進總花費。"}],
+    vals:pre||{from:names[1]||names[0],to:names[0],amt:0,date:dstr(new Date())},
+    onSave(v){
+      if(v.from===v.to){toast("還款人和收款人不能是同一人");return false}
+      if(!(v.amt>0)){toast("請輸入金額");return false}
+      upsert(t,"settlements",{id:uid(),from:v.from,to:v.to,amt:v.amt,cur:t.baseCur,date:v.date||dstr(new Date())});
     }});
 }
 function shopForm(x){
